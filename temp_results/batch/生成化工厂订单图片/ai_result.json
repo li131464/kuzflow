@@ -1,0 +1,17 @@
+{
+  "image_name": "生成化工厂订单图片",
+  "ocr_file": "E:\\code\\kuz_ai\\kuzflow\\temp_results\\batch\\生成化工厂订单图片\\ocr_result.json",
+  "success": true,
+  "ocr_info": {
+    "text_lines_count": 15,
+    "confidence_avg": 0.9911375045776367,
+    "raw_text": "XX化工贸易公司\n行方公司\n购买物品\n硫酸\n名称\n酸\n订量\n数量\n500升\n订单\n数量：500升\n订单\n下订单日期：\n2024年7月1日\n豆包AI生成"
+  },
+  "ai_extraction": {
+    "company_name": "XX化工贸易公司",
+    "product_name": "硫酸",
+    "product_quantity": "500升",
+    "order_date": "2024年7月1日"
+  },
+  "model_response": "不包括任何额外内容。\n</think>\n\n```json\n{\n    \"company_name\": \"XX化工贸易公司\",\n    \"product_name\": \"硫酸\",\n    \"product_quantity\": \"500升\",\n    \"order_date\": \"2024年7月1日\"\n}\n```"
+}
