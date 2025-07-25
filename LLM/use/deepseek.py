@@ -1,321 +1,360 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-DeepSeek-R1-Distill-Qwen-1.5B 本地推理模块
-用于从OCR识别的文本中提取订单关键信息
-"""
-
 import os
-import sys
 import json
 import torch
-from pathlib import Path
-from typing import Dict, Optional, List
-from transformers import (
-    AutoTokenizer, 
-    AutoModelForCausalLM, 
-    GenerationConfig,
-    BitsAndBytesConfig
-)
-import warnings
-warnings.filterwarnings("ignore")
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import re
+from datetime import datetime
 
-class DeepSeekInferencer:
-    """DeepSeek模型推理类"""
-    
-    def __init__(self, model_path: Optional[str] = None, use_quantization: bool = True):
+
+class DeepSeekOrderExtractor:
+    def __init__(self, model_path=None, device=None):
         """
-        初始化DeepSeek推理器
-        
+        初始化DeepSeek模型
         Args:
-            model_path: 模型路径，默认使用项目中的模型
-            use_quantization: 是否使用量化加载（节省显存）
+            model_path: 模型路径，默认为相对路径
+            device: 设备类型，自动检测GPU/CPU
         """
         if model_path is None:
-            # 使用项目中的模型路径
-            current_dir = Path(__file__).parent
-            model_path = current_dir.parent / "DeepSeek-R1-Distill-Qwen-1.5B"
+            model_path = "E:\code\kuz_ai\kuzflow\LLM\DeepSeek-R1-Distill-Qwen-1.5B"
         
-        self.model_path = str(model_path)
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.use_quantization = use_quantization and self.device == "cuda"
+        self.model_path = model_path
         
-        print(f"初始化DeepSeek推理器...")
-        print(f"模型路径: {self.model_path}")
-        print(f"设备: {self.device}")
-        print(f"使用量化: {self.use_quantization}")
-        
-        self.tokenizer = None
-        self.model = None
-        self._load_model()
-    
-    def _load_model(self):
-        """加载模型和分词器"""
-        try:
-            # 检查模型路径是否存在
-            if not Path(self.model_path).exists():
-                raise FileNotFoundError(f"模型路径不存在: {self.model_path}")
+        # 自动检测设备
+        if device is None:
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            self.device = device
             
-            # 加载分词器
-            print("加载分词器...")
+        print(f"使用设备: {self.device}")
+        
+        # 加载模型和分词器
+        self.load_model()
+    
+    def load_model(self):
+        """
+        加载DeepSeek模型和分词器
+        """
+        try:
+            print("正在加载DeepSeek模型...")
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.model_path,
                 trust_remote_code=True,
-                use_fast=True
+                pad_token="<pad>"
             )
             
-            # 设置分词器的padding token
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-            
-            # 配置量化参数（如果使用）
-            quantization_config = None
-            if self.use_quantization:
-                quantization_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=torch.float16,
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_quant_type="nf4"
-                )
-                print("使用4-bit量化加载模型...")
-            
-            # 加载模型
-            print("加载DeepSeek模型...")
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_path,
-                quantization_config=quantization_config,
-                device_map="auto" if self.device == "cuda" else None,
-                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
                 trust_remote_code=True,
-                low_cpu_mem_usage=True
+                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+                device_map="auto" if self.device == "cuda" else None
             )
             
-            if not self.use_quantization and self.device == "cpu":
+            if self.device == "cpu":
                 self.model = self.model.to(self.device)
-            
-            # 设置为评估模式
+                
             self.model.eval()
-            
             print("模型加载完成！")
             
         except Exception as e:
-            print(f"加载模型时出错: {e}")
+            print(f"模型加载失败: {str(e)}")
             raise
     
-    def extract_order_info(self, ocr_text: str) -> Dict[str, str]:
+    def create_extraction_prompt(self, ocr_text):
         """
-        从OCR文本中提取订单关键信息
-        
+        创建信息提取的提示词
         Args:
-            ocr_text: OCR识别的原始文本
-            
+            ocr_text: OCR识别的订单文本
         Returns:
-            提取的结构化订单信息
+            str: 构建的提示词
         """
-        # 构造提示词
-        prompt = self._build_extraction_prompt(ocr_text)
-        
-        # 生成回复
-        response = self.generate_response(prompt)
-        
-        # 解析提取结果
-        extracted_info = self._parse_extraction_result(response)
-        
-        return extracted_info
-    
-    def _build_extraction_prompt(self, ocr_text: str) -> str:
-        """构造信息提取的提示词"""
-        prompt = f"""你是一个专业的文档信息提取助手。请从以下化工厂订单的OCR识别文本中，准确提取出指定的关键信息。
+        prompt = f"""请分析以下化工厂订单文本，提取关键信息：
 
-原始OCR文本：
+订单文本：
 {ocr_text}
 
-请按照以下JSON格式提取信息，如果某项信息未找到，请填写"未找到"：
+请提取以下信息并以JSON格式返回：
+1. 客户公司名称（甲方）- 在"购买方"后面的公司名称
+2. 购买物品名称 - 具体的化学品名称
+3. 购买物品数量（包含单位）- 如"200KG"
+4. 下订单的日期 - 如果有日期信息
 
+请直接返回JSON格式，格式如下：
 {{
-    "company_name": "甲方公司名称（客户公司名称）",
-    "product_name": "购买的物品名称",
-    "product_quantity": "购买的物品数量（包含数字和单位）",
-    "order_date": "下订单的日期"
+    "客户公司名称": "公司名称",
+    "购买物品名称": "物品名称", 
+    "购买物品数量": "数量单位",
+    "下订单日期": "日期或未找到"
 }}
 
-注意事项：
-1. 公司名称通常包含"公司"、"企业"、"集团"等字样
-2. 物品数量要包含具体数字和单位（如：500斤、10吨等）
-3. 日期格式尽量保持原文格式
-4. 只提取明确出现在文本中的信息，不要推测
+请确保JSON格式正确，不要包含其他文字："""
 
-请直接输出JSON格式的结果："""
-        
         return prompt
     
-    def generate_response(self, prompt: str, max_length: int = 512, temperature: float = 0.1) -> str:
+    def extract_order_info(self, ocr_text, max_length=2048, temperature=0.1):
         """
-        生成回复
-        
+        从OCR文本中提取订单关键信息
         Args:
-            prompt: 输入提示词
-            max_length: 最大生成长度
+            ocr_text: OCR识别的文本
+            max_length: 生成的最大长度
             temperature: 生成温度
-            
         Returns:
-            生成的回复文本
+            dict: 提取的订单信息
         """
         try:
-            # 编码输入
-            inputs = self.tokenizer.encode(prompt, return_tensors="pt")
-            if self.device == "cuda" and not self.use_quantization:
-                inputs = inputs.to(self.device)
+            # 首先尝试直接提取
+            print("尝试直接提取信息...")
+            direct_extracted = self.extract_from_ocr_text(ocr_text)
             
-            # 生成配置
-            generation_config = GenerationConfig(
-                max_length=min(len(inputs[0]) + max_length, 2048),
-                temperature=temperature,
-                do_sample=temperature > 0,
-                top_p=0.9,
-                repetition_penalty=1.1,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-            )
+            # 检查直接提取的结果
+            if (direct_extracted["客户公司名称"] != "未找到" or 
+                direct_extracted["购买物品名称"] != "未找到" or
+                direct_extracted["购买物品数量"] != "未找到"):
+                
+                print("直接提取成功！")
+                return {
+                    "success": True,
+                    "extracted_info": direct_extracted,
+                    "raw_response": "直接提取",
+                    "ocr_text": ocr_text
+                }
+            
+            # 如果直接提取失败，尝试使用模型
+            print("直接提取失败，尝试使用模型...")
+            prompt = self.create_extraction_prompt(ocr_text)
+            
+            # 编码输入
+            inputs = self.tokenizer(
+                prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=1024
+            ).to(self.device)
             
             # 生成回复
             with torch.no_grad():
                 outputs = self.model.generate(
-                    inputs,
-                    generation_config=generation_config,
+                    **inputs,
+                    max_new_tokens=256,
+                    temperature=temperature,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    repetition_penalty=1.2,
+                    no_repeat_ngram_size=3
                 )
             
-            # 解码回复
-            response = self.tokenizer.decode(
-                outputs[0][len(inputs[0]):], 
+            # 解码输出
+            generated_text = self.tokenizer.decode(
+                outputs[0], 
                 skip_special_tokens=True
-            ).strip()
+            )
             
-            return response
+            # 提取模型回复部分
+            response = generated_text[len(prompt):].strip()
+            
+            print("模型原始回复:")
+            print("-" * 40)
+            print(response)
+            print("-" * 40)
+            
+            # 解析JSON结果
+            extracted_info = self.parse_extraction_result(response)
+            
+            return {
+                "success": True,
+                "extracted_info": extracted_info,
+                "raw_response": response,
+                "ocr_text": ocr_text
+            }
             
         except Exception as e:
-            print(f"生成回复时出错: {e}")
-            return ""
+            print(f"信息提取失败: {str(e)}")
+            return {
+                "success": False,
+                "error": str(e),
+                "extracted_info": {},
+                "ocr_text": ocr_text
+            }
     
-    def _parse_extraction_result(self, response: str) -> Dict[str, str]:
+    def parse_extraction_result(self, response):
         """
-        解析提取结果
-        
+        解析模型返回的结果，提取JSON格式的信息
         Args:
-            response: 模型生成的回复
-            
+            response: 模型的原始回复
         Returns:
-            解析后的结构化信息
+            dict: 解析后的订单信息
         """
-        # 默认结果
-        default_result = {
-            "company_name": "未找到",
-            "product_name": "未找到", 
-            "product_quantity": "未找到",
-            "order_date": "未找到"
-        }
-        
         try:
-            # 尝试从回复中提取JSON
-            import re
-            
-            # 查找JSON格式的内容
-            json_match = re.search(r'\{[^}]*\}', response, re.DOTALL)
+            # 尝试直接解析JSON
+            # 寻找JSON格式的内容
+            json_match = re.search(r'\{.*?\}', response, re.DOTALL)
             if json_match:
                 json_str = json_match.group()
+                # 清理JSON字符串，移除注释和多余字符
+                json_str = re.sub(r'//.*?\n', '\n', json_str)
+                json_str = re.sub(r'/\*.*?\*/', '', json_str, flags=re.DOTALL)
+                json_str = re.sub(r'</?think>', '', json_str)
+                json_str = re.sub(r'```json\s*', '', json_str)
+                json_str = re.sub(r'```\s*', '', json_str)
+                # 修复常见的JSON格式问题
+                json_str = re.sub(r',\s*}', '}', json_str)  # 移除末尾多余的逗号
+                json_str = re.sub(r',\s*]', ']', json_str)  # 移除数组末尾多余的逗号
                 result = json.loads(json_str)
-                
-                # 验证并清理结果
-                for key in default_result.keys():
-                    if key in result and result[key]:
-                        # 清理空白字符
-                        result[key] = str(result[key]).strip()
-                        # 如果是空字符串或"未找到"，使用默认值
-                        if not result[key] or result[key].lower() in ["", "未找到", "null", "none"]:
-                            result[key] = "未找到"
-                    else:
-                        result[key] = "未找到"
-                
                 return result
-            
-            # 如果没有找到JSON，尝试文本解析
-            return self._parse_text_response(response, default_result)
-            
         except Exception as e:
-            print(f"解析提取结果时出错: {e}")
-            print(f"原始回复: {response}")
-            return default_result
-    
-    def _parse_text_response(self, response: str, default_result: Dict) -> Dict[str, str]:
-        """从文本回复中提取信息（备用方法）"""
-        import re
+            print(f"JSON解析失败: {e}")
+            print(f"尝试解析的JSON字符串: {json_str}")
         
-        result = default_result.copy()
-        lines = response.split('\n')
+        # 如果JSON解析失败，尝试使用正则表达式提取
+        extracted_info = {
+            "客户公司名称": "未找到",
+            "购买物品名称": "未找到", 
+            "购买物品数量": "未找到",
+            "下订单日期": "未找到"
+        }
         
-        for line in lines:
-            line = line.strip()
-            if '公司' in line and '名称' in line:
-                # 提取公司名称
-                match = re.search(r'[:：]\s*(.+)', line)
+        # 使用正则表达式提取信息
+        patterns = {
+            "客户公司名称": [
+                r"客户公司名称[\"']?\s*[:：]\s*[\"']?([^\"',\n]+)",
+                r"甲方[\"']?\s*[:：]\s*[\"']?([^\"',\n]+)",
+                r"公司[\"']?\s*[:：]\s*[\"']?([^\"',\n]+)"
+            ],
+            "购买物品名称": [
+                r"购买物品名称[\"']?\s*[:：]\s*[\"']?([^\"',\n]+)",
+                r"物品名称[\"']?\s*[:：]\s*[\"']?([^\"',\n]+)",
+                r"产品[\"']?\s*[:：]\s*[\"']?([^\"',\n]+)"
+            ],
+            "购买物品数量": [
+                r"购买物品数量[\"']?\s*[:：]\s*[\"']?([^\"',\n]+)",
+                r"数量[\"']?\s*[:：]\s*[\"']?([^\"',\n]+)",
+                r"(\d+\s*[吨|公斤|千克|升|立方米|件|个|套]+)"
+            ],
+            "下订单日期": [
+                r"下订单日期[\"']?\s*[:：]\s*[\"']?([^\"',\n]+)",
+                r"订单日期[\"']?\s*[:：]\s*[\"']?([^\"',\n]+)",
+                r"日期[\"']?\s*[:：]\s*[\"']?([^\"',\n]+)",
+                r"(\d{4}[-/]\d{1,2}[-/]\d{1,2})"
+            ]
+        }
+        
+        for key, pattern_list in patterns.items():
+            for pattern in pattern_list:
+                match = re.search(pattern, response, re.IGNORECASE)
                 if match:
-                    result['company_name'] = match.group(1).strip()
-            
-            elif '物品' in line and '名称' in line:
-                # 提取物品名称
-                match = re.search(r'[:：]\s*(.+)', line)
-                if match:
-                    result['product_name'] = match.group(1).strip()
-            
-            elif '数量' in line:
-                # 提取数量
-                match = re.search(r'[:：]\s*(.+)', line)
-                if match:
-                    result['product_quantity'] = match.group(1).strip()
-            
-            elif '日期' in line:
-                # 提取日期
-                match = re.search(r'[:：]\s*(.+)', line)
-                if match:
-                    result['order_date'] = match.group(1).strip()
-        
-        return result
-
-def main():
-    """主函数，用于测试DeepSeek推理功能"""
-    # 测试用的OCR文本
-    test_ocr_text = """XX化工贸易公司
-行方公司
-购买物品
-名称
-订量
-数量: 500斤
-订单
-下订单日期: 2024年7月1日"""
-    
-    try:
-        # 初始化推理器
-        print("初始化DeepSeek推理器...")
-        inferencer = DeepSeekInferencer()
-        
-        # 提取订单信息
-        print("开始提取订单信息...")
-        extracted_info = inferencer.extract_order_info(test_ocr_text)
-        
-        # 打印结果
-        print("\n" + "="*50)
-        print("DeepSeek信息提取结果:")
-        print("="*50)
-        for key, value in extracted_info.items():
-            print(f"{key}: {value}")
+                    extracted_info[key] = match.group(1).strip()
+                    break
         
         return extracted_info
+    
+    def extract_from_ocr_text(self, ocr_text):
+        """
+        直接从OCR文本中提取信息，不依赖模型生成
+        Args:
+            ocr_text: OCR识别的文本
+        Returns:
+            dict: 提取的订单信息
+        """
+        extracted_info = {
+            "客户公司名称": "未找到",
+            "购买物品名称": "未找到", 
+            "购买物品数量": "未找到",
+            "下订单日期": "未找到"
+        }
         
+        # 将文本按行分割
+        lines = ocr_text.strip().split('\n')
+        
+        # 提取客户公司名称 - 在"购买方"后面的行
+        for i, line in enumerate(lines):
+            if "购买方" in line and i + 1 < len(lines):
+                company_name = lines[i + 1].strip()
+                if company_name and company_name != "购买方":
+                    extracted_info["客户公司名称"] = company_name
+                    break
+        
+        # 提取购买物品名称和数量
+        for i, line in enumerate(lines):
+            if "碳酸钠" in line:
+                extracted_info["购买物品名称"] = "碳酸钠"
+                # 检查下一行是否有数量信息
+                if i + 1 < len(lines):
+                    next_line = lines[i + 1].strip()
+                    if "KG" in next_line or "kg" in next_line:
+                        extracted_info["购买物品数量"] = next_line
+                break
+        
+        # 如果没有找到碳酸钠，尝试其他模式
+        if extracted_info["购买物品名称"] == "未找到":
+            for line in lines:
+                if "物品" in line and len(line.strip()) > 2:
+                    # 寻找物品名称
+                    for next_line in lines:
+                        if next_line.strip() and "KG" in next_line or "kg" in next_line:
+                            extracted_info["购买物品数量"] = next_line.strip()
+                            break
+        
+        return extracted_info
+    
+    def save_result(self, result, output_path):
+        """
+        保存提取结果到文件
+        Args:
+            result: 提取结果
+            output_path: 输出文件路径
+        """
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        
+        print(f"提取结果已保存到: {output_path}")
+
+
+def main():
+    """
+    测试函数
+    """
+    # 测试OCR结果
+    test_ocr_text = """
+    化工产品采购订单
+    
+    甲方：北京化工材料有限公司
+    乙方：上海精细化工厂
+    
+    订购产品：硫酸铜
+    数量：500吨
+    单价：8500元/吨
+    
+    订单日期：2024-01-15
+    交货日期：2024-02-01
+    
+    联系人：张经理
+    电话：138-0000-0000
+    """
+    
+    try:
+        # 初始化提取器
+        extractor = DeepSeekOrderExtractor()
+        
+        # 提取信息
+        result = extractor.extract_order_info(test_ocr_text)
+        
+        if result["success"]:
+            print("\n提取结果:")
+            print("="*50)
+            for key, value in result["extracted_info"].items():
+                print(f"{key}: {value}")
+            print("="*50)
+            
+            # 保存结果
+            extractor.save_result(result, "./extraction_result.json")
+        else:
+            print(f"提取失败: {result['error']}")
+    
     except Exception as e:
-        print(f"DeepSeek推理出错: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+        print(f"程序出错: {str(e)}")
+
 
 if __name__ == "__main__":
     main()

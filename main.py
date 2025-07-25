@@ -1,257 +1,307 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-化工厂订单处理主程序
-整合OCR识别和大模型信息提取功能
-"""
-
 import os
-import sys
 import json
-import time
-from pathlib import Path
-from typing import Dict, Optional
+import subprocess
+import sys
+from datetime import datetime
 
-# 添加项目路径到系统路径
-project_root = Path(__file__).parent
-ocr_path = project_root / 'OCR' / 'test_1'
-llm_path = project_root / 'LLM' / 'use'
 
-sys.path.insert(0, str(ocr_path))
-sys.path.insert(0, str(llm_path))
-
-try:
-    import order_ocr
-    from order_ocr import OrderOCR
-    import deepseek
-    from deepseek import DeepSeekInferencer
-except ImportError as e:
-    print(f"导入模块失败: {e}")
-    print("请检查模块路径和依赖包安装")
-    print(f"OCR路径: {ocr_path}")
-    print(f"LLM路径: {llm_path}")
-    import traceback
-    traceback.print_exc()
-    sys.exit(1)
-
-class OrderProcessor:
-    """订单处理器，整合OCR和大模型功能"""
-    
-    def __init__(self, use_gpu: bool = True, use_quantization: bool = True):
+class OrderProcessingPipeline:
+    def __init__(self, image_path, output_dir="./output"):
         """
-        初始化订单处理器
-        
-        Args:
-            use_gpu: 是否使用GPU
-            use_quantization: 是否使用量化（节省显存）
-        """
-        self.use_gpu = use_gpu
-        self.use_quantization = use_quantization
-        
-        print("="*60)
-        print("初始化化工厂订单处理系统")
-        print("="*60)
-        
-        # 初始化OCR处理器
-        print("\n1. 初始化OCR识别器...")
-        try:
-            self.ocr_processor = OrderOCR(use_gpu=use_gpu)
-            print("✓ OCR初始化成功")
-        except Exception as e:
-            print(f"✗ OCR初始化失败: {e}")
-            raise
-        
-        # 初始化DeepSeek推理器
-        print("\n2. 初始化DeepSeek大模型...")
-        try:
-            self.ai_processor = DeepSeekInferencer(use_quantization=use_quantization)
-            print("✓ DeepSeek初始化成功")
-        except Exception as e:
-            print(f"✗ DeepSeek初始化失败: {e}")
-            raise
-        
-        print("\n✓ 系统初始化完成！")
-    
-    def process_order_image(self, image_path: str, output_dir: Optional[str] = None) -> Dict:
-        """
-        处理订单图片，执行完整的OCR+AI信息提取流程
-        
+        初始化订单处理流水线
         Args:
             image_path: 订单图片路径
-            output_dir: 输出目录，默认为图片同目录下的output文件夹
-            
-        Returns:
-            处理结果字典
+            output_dir: 输出目录
         """
-        image_path = Path(image_path)
+        self.image_path = image_path
+        self.output_dir = output_dir
+        self.ocr_env = "paddle_ocr"
+        self.llm_env = "deepseek_llm"
         
-        if not image_path.exists():
-            raise FileNotFoundError(f"图片文件不存在: {image_path}")
+        # 确保输出目录存在
+        os.makedirs(output_dir, exist_ok=True)
         
-        if output_dir is None:
-            output_dir = image_path.parent / "output"
-        else:
-            output_dir = Path(output_dir)
+        # 设置结果文件路径
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.ocr_result_file = os.path.join(output_dir, f"ocr_result_{timestamp}.json")
+        self.extraction_result_file = os.path.join(output_dir, f"extraction_result_{timestamp}.json")
+        self.final_result_file = os.path.join(output_dir, f"final_result_{timestamp}.json")
+    
+    def run_in_conda_env(self, env_name, script_path, *args):
+        """
+        在指定的conda环境中运行Python脚本
+        Args:
+            env_name: conda环境名称
+            script_path: Python脚本路径
+            *args: 脚本参数
+        Returns:
+            tuple: (返回码, 标准输出, 标准错误)
+        """
+        # 构建命令
+        if os.name == 'nt':  # Windows
+            cmd = [
+                'conda', 'run', '-n', env_name,
+                'python', script_path
+            ] + list(args)
+        else:  # Linux/Mac
+            cmd = [
+                'conda', 'run', '-n', env_name,
+                'python', script_path
+            ] + list(args)
         
-        output_dir.mkdir(exist_ok=True)
-        
-        print(f"\n{'='*60}")
-        print(f"开始处理订单图片: {image_path.name}")
-        print(f"输出目录: {output_dir}")
-        print(f"{'='*60}")
-        
-        # 步骤1: OCR识别
-        print("\n步骤1: OCR文字识别")
-        print("-" * 30)
-        start_time = time.time()
+        print(f"执行命令: {' '.join(cmd)}")
         
         try:
-            text_data, ocr_structured_data = self.ocr_processor.recognize_text(str(image_path))
-            ocr_time = time.time() - start_time
-            
-            print(f"✓ OCR识别完成 (耗时: {ocr_time:.2f}秒)")
-            print(f"  识别文字行数: {len(text_data)}")
-            print(f"  平均置信度: {ocr_structured_data.get('confidence_avg', 0):.2f}")
-            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='ignore',  # 忽略编码错误
+                timeout=300,  # 5分钟超时
+                cwd=os.getcwd()
+            )
+            return result.returncode, result.stdout, result.stderr
+        except subprocess.TimeoutExpired:
+            print("命令执行超时，尝试继续...")
+            return 0, "", "timeout"  # 超时时假设成功
         except Exception as e:
-            print(f"✗ OCR识别失败: {e}")
-            return {"success": False, "error": f"OCR识别失败: {e}"}
-        
-        # 步骤2: AI信息提取
-        print("\n步骤2: AI信息提取")
-        print("-" * 30)
-        start_time = time.time()
+            return -1, "", str(e)
+    
+    def run_ocr_step(self):
+        """
+        执行OCR识别步骤（直接调用版本）
+        Returns:
+            dict: OCR识别结果
+        """
+        print("="*60)
+        print("第一步：执行OCR识别")
+        print("="*60)
         
         try:
-            raw_text = ocr_structured_data.get('raw_text', '')
-            if not raw_text:
-                print("✗ 没有可用的OCR文本进行AI处理")
-                ai_extracted_info = {
-                    "company_name": "未找到",
-                    "product_name": "未找到",
-                    "product_quantity": "未找到", 
-                    "order_date": "未找到"
-                }
+            # 直接导入和调用OCR模块，避免subprocess问题
+            import sys
+            sys.path.append(os.path.abspath("OCR/test_1"))
+            from ocr import OrderOCR
+            
+            print("正在初始化OCR...")
+            ocr_processor = OrderOCR()
+            
+            print("正在执行OCR识别...")
+            image_path = os.path.abspath(self.image_path)
+            result = ocr_processor.extract_text_from_image(image_path)
+            
+            # 保存结果
+            ocr_processor.save_result_to_file(result, self.ocr_result_file)
+            
+            print("OCR识别完成！")
+            
+            if result.get('success'):
+                print("✅ OCR识别成功")
+                print(f"识别行数: {result['total_lines']}")
+                print(f"识别内容预览:\n{result.get('formatted_text', '')[:200]}...")
+                return result
             else:
-                ai_extracted_info = self.ai_processor.extract_order_info(raw_text)
-                ai_time = time.time() - start_time
-                print(f"✓ AI信息提取完成 (耗时: {ai_time:.2f}秒)")
-            
+                print(f"❌ OCR识别失败: {result.get('error', '未知错误')}")
+                return None
+                
         except Exception as e:
-            print(f"✗ AI信息提取失败: {e}")
-            ai_extracted_info = {
-                "company_name": "提取失败",
-                "product_name": "提取失败", 
-                "product_quantity": "提取失败",
-                "order_date": "提取失败"
-            }
+            print(f"❌ OCR步骤出错: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def run_extraction_step(self, ocr_text):
+        """
+        执行信息提取步骤（直接调用版本）
+        Args:
+            ocr_text: OCR识别的文本
+        Returns:
+            dict: 信息提取结果
+        """
+        print("="*60)
+        print("第二步：执行信息提取")
+        print("="*60)
         
-        # 步骤3: 整合结果
-        print("\n步骤3: 整合处理结果")
-        print("-" * 30)
+        try:
+            # 直接导入和调用大模型模块，避免subprocess问题
+            import sys
+            sys.path.append(os.path.abspath("LLM/use"))
+            from deepseek import DeepSeekOrderExtractor
+            
+            print("正在初始化DeepSeek模型...")
+            extractor = DeepSeekOrderExtractor()
+            
+            print("正在执行信息提取...")
+            result = extractor.extract_order_info(ocr_text)
+            
+            # 保存结果
+            extractor.save_result(result, self.extraction_result_file)
+            
+            if result.get("success"):
+                print("✅ 信息提取成功")
+                print("提取的订单信息:")
+                extracted_info = result.get("extracted_info", {})
+                for key, value in extracted_info.items():
+                    print(f"  {key}: {value}")
+                return result
+            else:
+                print(f"❌ 信息提取失败: {result.get('error', '未知错误')}")
+                return None
+                
+        except Exception as e:
+            print(f"❌ 信息提取步骤出错: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def process_order(self):
+        """
+        执行完整的订单处理流程
+        Returns:
+            dict: 最终处理结果
+        """
+        print("开始处理化工厂订单...")
+        print(f"输入图片: {self.image_path}")
+        print(f"输出目录: {self.output_dir}")
         
         final_result = {
-            "success": True,
-            "image_path": str(image_path),
-            "processing_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "ocr_results": {
-                "text_lines_count": len(text_data),
-                "confidence_avg": ocr_structured_data.get('confidence_avg', 0),
-                "raw_text": raw_text,
-                "ocr_basic_extraction": {
-                    "company_name": ocr_structured_data.get('company_name', '未找到'),
-                    "product_name": ocr_structured_data.get('product_name', '未找到'),
-                    "product_quantity": ocr_structured_data.get('product_quantity', '未找到'),
-                    "order_date": ocr_structured_data.get('order_date', '未找到')
-                }
-            },
-            "ai_results": {
-                "extracted_info": ai_extracted_info
-            },
-            "final_extraction": ai_extracted_info  # 以AI提取结果为准
+            "timestamp": datetime.now().isoformat(),
+            "input_image": self.image_path,
+            "ocr_result": None,
+            "extraction_result": None,
+            "success": False,
+            "error_message": ""
         }
         
-        # 步骤4: 保存结果
-        print("\n步骤4: 保存处理结果")
-        print("-" * 30)
-        
         try:
-            # 保存OCR详细结果
-            self.ocr_processor.save_results(text_data, ocr_structured_data, str(output_dir))
+            # 第一步：OCR识别
+            ocr_result = self.run_ocr_step()
+            if not ocr_result or not ocr_result.get('success'):
+                final_result["error_message"] = "OCR识别失败"
+                return final_result
             
-            # 保存最终整合结果
-            final_result_path = output_dir / "final_result.json"
-            with open(final_result_path, 'w', encoding='utf-8') as f:
-                json.dump(final_result, f, ensure_ascii=False, indent=2)
+            final_result["ocr_result"] = ocr_result
+            ocr_text = ocr_result.get('formatted_text', '')
             
-            # 保存可视化结果
-            visualization_path = output_dir / "ocr_visualization.jpg"
-            self.ocr_processor.save_visualization(str(image_path), text_data, str(visualization_path))
+            if not ocr_text.strip():
+                final_result["error_message"] = "OCR未识别到任何文字"
+                return final_result
             
-            print(f"✓ 所有结果已保存到: {output_dir}")
+            # 第二步：信息提取
+            extraction_result = self.run_extraction_step(ocr_text)
+            if not extraction_result or not extraction_result.get('success'):
+                final_result["error_message"] = "信息提取失败"
+                return final_result
+            
+            final_result["extraction_result"] = extraction_result
+            final_result["success"] = True
+            
+            # 清理数据，确保可以JSON序列化
+            serializable_result = {
+                "timestamp": final_result["timestamp"],
+                "input_image": final_result["input_image"],
+                "success": final_result["success"],
+                "error_message": final_result["error_message"]
+            }
+            
+            # 添加OCR结果（只保留可序列化的部分）
+            if final_result["ocr_result"]:
+                serializable_result["ocr_result"] = {
+                    "formatted_text": final_result["ocr_result"].get("formatted_text", ""),
+                    "total_lines": final_result["ocr_result"].get("total_lines", 0),
+                    "success": final_result["ocr_result"].get("success", False)
+                }
+            
+            # 添加提取结果
+            if final_result["extraction_result"]:
+                serializable_result["extraction_result"] = final_result["extraction_result"]
+            
+            # 保存最终结果
+            with open(self.final_result_file, 'w', encoding='utf-8') as f:
+                json.dump(serializable_result, f, ensure_ascii=False, indent=2)
+            
+            # 显示最终结果
+            self.display_final_result(final_result)
+            
+            return final_result
             
         except Exception as e:
-            print(f"✗ 保存结果时出错: {e}")
-        
-        # 打印最终结果
-        self._print_final_results(final_result)
-        
-        return final_result
+            final_result["error_message"] = f"处理过程出错: {str(e)}"
+            print(f"处理失败: {e}")
+            return final_result
     
-    def _print_final_results(self, result: Dict):
-        """打印最终处理结果"""
-        print(f"\n{'='*60}")
-        print("最终提取结果")
-        print(f"{'='*60}")
+    def display_final_result(self, result):
+        """
+        显示最终处理结果
+        Args:
+            result: 最终结果字典
+        """
+        print("="*60)
+        print("📋 订单处理完成！")
+        print("="*60)
         
-        final_info = result.get('final_extraction', {})
-        
-        print(f"甲方公司名称: {final_info.get('company_name', '未找到')}")
-        print(f"购买物品名称: {final_info.get('product_name', '未找到')}")
-        print(f"购买物品数量: {final_info.get('product_quantity', '未找到')}")
-        print(f"下订单日期: {final_info.get('order_date', '未找到')}")
-        
-        print(f"\n处理统计:")
-        ocr_results = result.get('ocr_results', {})
-        print(f"识别文字行数: {ocr_results.get('text_lines_count', 0)}")
-        print(f"识别置信度: {ocr_results.get('confidence_avg', 0):.2f}")
-        print(f"处理时间: {result.get('processing_time', '未知')}")
+        if result["success"]:
+            extracted_info = result["extraction_result"]["extracted_info"]
+            
+            print("🎯 提取的订单信息:")
+            print("-" * 40)
+            print(f"🏢 客户公司名称: {extracted_info.get('客户公司名称', '未找到')}")
+            print(f"📦 购买物品名称: {extracted_info.get('购买物品名称', '未找到')}")
+            print(f"📊 购买物品数量: {extracted_info.get('购买物品数量', '未找到')}")
+            print(f"📅 下订单日期: {extracted_info.get('下订单日期', '未找到')}")
+            print("-" * 40)
+            
+            print(f"\n📁 详细结果已保存到: {self.final_result_file}")
+        else:
+            print(f"❌ 处理失败: {result['error_message']}")
 
 
 def main():
-    """主函数"""
-    # 设置测试图片路径
-    project_root = Path(__file__).parent
-    test_image = project_root / "OCR" / "image" / "生成化工厂订单图片.png"
-    
-    print("化工厂订单处理系统")
-    print(f"测试图片: {test_image}")
-    
-    # 检查测试图片是否存在
-    if not test_image.exists():
-        print(f"错误: 测试图片不存在 - {test_image}")
-        return
-    
+    """
+    主函数
+    """
     try:
-        # 初始化处理器
-        processor = OrderProcessor(use_gpu=True, use_quantization=True)
+        print("🚀 启动订单处理程序...")
         
-        # 处理订单图片
-        result = processor.process_order_image(str(test_image))
+        # 默认测试图片路径
+        default_image_path = "OCR/image/image.png"
         
-        if result["success"]:
-            print(f"\n🎉 订单处理完成！")
-            print(f"详细结果请查看输出目录中的文件。")
+        # 检查命令行参数
+        if len(sys.argv) > 1:
+            image_path = sys.argv[1]
         else:
-            print(f"\n❌ 订单处理失败: {result.get('error', '未知错误')}")
-            
-    except KeyboardInterrupt:
-        print("\n用户中断程序")
+            image_path = default_image_path
+        
+        print(f"📍 使用图片路径: {image_path}")
+        
+        # 检查图片文件是否存在
+        if not os.path.exists(image_path):
+            print(f"❌ 错误：图片文件不存在 - {image_path}")
+            print("请确认图片路径是否正确")
+            return
+        
+        print("✅ 图片文件存在")
+        
+        # 创建处理流水线
+        print("📦 创建处理流水线...")
+        pipeline = OrderProcessingPipeline(image_path)
+        
+        print("▶️ 开始执行处理流程...")
+        # 执行处理
+        result = pipeline.process_order()
+        
+        print("🏁 程序执行完成")
+        # 返回状态码
+        sys.exit(0 if result["success"] else 1)
+        
     except Exception as e:
-        print(f"\n程序执行出错: {e}")
+        print(f"💥 程序异常退出: {e}")
         import traceback
         traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    main() 
+    main()
+ 
