@@ -374,3 +374,4 @@ PaddleOCR 的发展离不开社区贡献！💗衷心感谢所有开发者、合
       url={https://arxiv.org/abs/2507.05595}
 }
 ```
+push 测试
